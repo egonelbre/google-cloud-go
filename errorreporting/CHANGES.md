@@ -1,5 +1,13 @@
 # Changes
 
+## [0.3.1](https://github.com/googleapis/google-cloud-go/compare/errorreporting/v0.3.0...errorreporting/v0.3.1) (2024-04-12)
+
+
+### Bug Fixes
+
+* **errorreporting:** Bump google.golang.org/api to v0.149.0 ([8d2ab9f](https://github.com/googleapis/google-cloud-go/commit/8d2ab9f320a86c1c0fab90513fc05861561d0880))
+* **errorreporting:** Update protobuf dep to v1.33.0 ([30b038d](https://github.com/googleapis/google-cloud-go/commit/30b038d8cac0b8cd5dd4761c87f3f298760dd33a))
+
 ## [0.3.0](https://github.com/googleapis/google-cloud-go/compare/errorreporting/v0.2.0...errorreporting/v0.3.0) (2022-11-17)
 
 
@@ -19,4 +27,3 @@
 
 This is the first tag to carve out errorreporting as its own module. See
 [Add a module to a multi-module repository](https://github.com/golang/go/wiki/Modules#is-it-possible-to-add-a-module-to-a-multi-module-repository).
-
