@@ -1,5 +1,18 @@
 # Changes
 
+## [1.61.0](https://github.com/googleapis/google-cloud-go/compare/spanner/v1.60.0...spanner/v1.61.0) (2024-04-12)
+
+
+### Features
+
+* **spanner/admin/instance:** Adding `EXPECTED_FULFILLMENT_PERIOD` to the indicate instance creation times (with `FULFILLMENT_PERIOD_NORMAL` or `FULFILLMENT_PERIOD_EXTENDED` ENUM) with the extended instance creation time triggered by On-Demand Capacity... ([#9693](https://github.com/googleapis/google-cloud-go/issues/9693)) ([aa93790](https://github.com/googleapis/google-cloud-go/commit/aa93790132ba830b4c97d217ef02764e2fb1b8ea))
+* **spanner/executor:** Add SessionPoolOptions, SpannerOptions protos in executor protos ([2cdc40a](https://github.com/googleapis/google-cloud-go/commit/2cdc40a0b4288f5ab5f2b2b8f5c1d6453a9c81ec))
+
+
+### Bug Fixes
+
+* **spanner:** Fix uint8 conversion ([9221c7f](https://github.com/googleapis/google-cloud-go/commit/9221c7fa12cef9d5fb7ddc92f41f1d6204971c7b))
+
 ## [1.60.0](https://github.com/googleapis/google-cloud-go/compare/spanner/v1.59.0...spanner/v1.60.0) (2024-03-19)
 
 
@@ -950,4 +963,3 @@
 
 This is the first tag to carve out spanner as its own module. See:
 https://github.com/golang/go/wiki/Modules#is-it-possible-to-add-a-module-to-a-multi-module-repository.
-
