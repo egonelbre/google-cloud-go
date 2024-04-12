@@ -1,6 +1,14 @@
 # Changelog
 
 
+## [1.7.0](https://github.com/googleapis/google-cloud-go/compare/discoveryengine/v1.6.0...discoveryengine/v1.7.0) (2024-04-12)
+
+
+### Features
+
+* **discoveryengine:** Support import data from Cloud Spanner, BigTable, SQL and Firestore ([cca3f47](https://github.com/googleapis/google-cloud-go/commit/cca3f47c895e7cac07d7d48ab3c4850b265a710f))
+* **discoveryengine:** Support import data from Cloud Spanner, BigTable, SQL and Firestore ([#9708](https://github.com/googleapis/google-cloud-go/issues/9708)) ([560f121](https://github.com/googleapis/google-cloud-go/commit/560f121b0914edb19b26011b6a0e805c17899230))
+
 ## [1.6.0](https://github.com/googleapis/google-cloud-go/compare/discoveryengine/v1.5.0...discoveryengine/v1.6.0) (2024-03-12)
 
 
@@ -148,4 +156,3 @@
 * **discoveryengine:** Start generating apiv1beta ([#7427](https://github.com/googleapis/google-cloud-go/issues/7427)) ([0d289a0](https://github.com/googleapis/google-cloud-go/commit/0d289a07106226b4398935357ab0f30a3a30340d))
 
 ## Changes
-
