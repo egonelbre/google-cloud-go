@@ -1016,15 +1016,23 @@ func (c *Client) rwTransaction(ctx context.Context, f func(context.Context, *Rea
 			}
 		}
 		initTx := func(t *ReadWriteTransaction) {
+			oldSeqno := t.txReadOnly.sequenceNumber
+			oldLastSent := t.txReadOnly.lastSentSequenceNumber
 			t.txReadOnly.sm = c.sm
 			t.txReadOnly.txReadEnv = t
 			t.txReadOnly.qo = c.qo
 			t.txReadOnly.ro = c.ro
 			t.txReadOnly.disableRouteToLeader = c.disableRouteToLeader
+			t.txReadOnly.sequenceNumber = 0
+			t.txReadOnly.lastSentSequenceNumber = 0
 			t.wb = []*Mutation{}
 			t.txOpts = c.txo.merge(options)
 			t.ct = c.ct
 			t.otConfig = c.otConfig
+			if os.Getenv("SPANNER_SEQNO_DEBUG") == "1" {
+				logf(sh.session.logger, "[SEQNO] initTx: txReadOnly=%p attempt=%d oldSeqno=%d oldLastSent=%d -> reset to 0",
+					&t.txReadOnly, attempt, oldSeqno, oldLastSent)
+			}
 		}
 		if t.shouldExplicitBegin(attempt, options) {
 			if t == nil {

@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +39,53 @@ import (
 
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 )
+
+// seqnoDebugEnabled controls whether sequence number debugging is enabled.
+// Set SPANNER_SEQNO_DEBUG=1 to enable.
+var seqnoDebugEnabled = os.Getenv("SPANNER_SEQNO_DEBUG") == "1"
+
+// seqnoDebugLog logs sequence number debugging information using the provided logger.
+func seqnoDebugLog(logger *log.Logger, format string, args ...interface{}) {
+	if seqnoDebugEnabled {
+		msg := fmt.Sprintf("[SEQNO] "+format, args...)
+		if logger != nil {
+			logger.Print(msg)
+		} else {
+			log.Print(msg)
+		}
+	}
+}
+
+// getLoggerFromSessionHandle safely retrieves the logger from a sessionHandle.
+// Returns nil if the sessionHandle or session is nil.
+func getLoggerFromSessionHandle(sh *sessionHandle) *log.Logger {
+	if sh == nil {
+		return nil
+	}
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	if sh.session == nil {
+		return nil
+	}
+	return sh.session.logger
+}
+
+// getTransactionSelectorDebugInfo returns a string describing the transaction selector.
+func getTransactionSelectorDebugInfo(ts *sppb.TransactionSelector) string {
+	if ts == nil {
+		return "nil"
+	}
+	switch sel := ts.GetSelector().(type) {
+	case *sppb.TransactionSelector_SingleUse:
+		return "SingleUse"
+	case *sppb.TransactionSelector_Id:
+		return fmt.Sprintf("Id(%x)", sel.Id)
+	case *sppb.TransactionSelector_Begin:
+		return fmt.Sprintf("Begin(mode=%T)", sel.Begin.GetMode())
+	default:
+		return fmt.Sprintf("Unknown(%T)", sel)
+	}
+}
 
 // transactionID stores a transaction ID which uniquely identifies a transaction
 // in Cloud Spanner.
@@ -75,6 +124,10 @@ type txReadOnly struct {
 
 	// Atomic. Only needed for DML statements, but used forall.
 	sequenceNumber int64
+	// lastSentSequenceNumber tracks the last sequence number that was actually
+	// sent to Spanner. Used to detect out-of-order sequence numbers caused by
+	// concurrent DML operations. Atomic.
+	lastSentSequenceNumber int64
 
 	// sm is the session manager for allocating a session to execute the read-only
 	// transaction. It is set only once during initialization of the
@@ -351,15 +404,24 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 	} else {
 		setTransactionID = nil
 	}
+	// Capture the original transaction selector for use in the streaming callback.
+	// This avoids race conditions where the transaction state changes between
+	// acquire() and when the callback is executed.
+	originalTS := ts
 	return streamWithTransactionCallbacks(
 		contextWithOutgoingMetadata(ctx, sh.getMetadata(), t.disableRouteToLeader),
 		sh.session.logger,
 		t.sm.sc.metricsTracerFactory,
 		func(ctx context.Context, resumeToken []byte, opts ...gax.CallOption) (streamingReceiver, error) {
+			// Use original transaction selector for first call, get fresh one for resumes
+			currentTS := originalTS
+			if len(resumeToken) > 0 {
+				currentTS = t.getTransactionSelector()
+			}
 			client, err := client.StreamingRead(ctx,
 				&sppb.ReadRequest{
 					Session:             t.sh.getID(),
-					Transaction:         t.getTransactionSelector(),
+					Transaction:         currentTS,
 					Table:               table,
 					Index:               index,
 					Columns:             columns,
@@ -373,7 +435,7 @@ func (t *txReadOnly) ReadWithOptions(ctx context.Context, table string, keys Key
 					LockHint:            lockHint,
 				}, opts...)
 			if err != nil {
-				if _, ok := t.getTransactionSelector().GetSelector().(*sppb.TransactionSelector_Begin); ok {
+				if _, ok := currentTS.GetSelector().(*sppb.TransactionSelector_Begin); ok {
 					t.setTransactionID(nil)
 					return client, t.updateTxState(errInlineBeginTransactionFailed(err))
 				}
@@ -698,11 +760,50 @@ func (t *txReadOnly) query(ctx context.Context, statement Statement, options Que
 			// This ensures that we return a reasonable error instead of panic if the application tries to use the
 			// stream after the transaction has finished.
 			if t.sh == nil {
+				seqnoDebugLog(nil, "query callback: session handle is nil, transaction no longer active")
 				return nil, errTransactionNoLongerActive()
 			}
+			logger := getLoggerFromSessionHandle(t.sh)
 			req.ResumeToken = resumeToken
 			req.Session = t.sh.getID()
-			req.Transaction = t.getTransactionSelector()
+			// Only update the transaction selector for resume operations.
+			// For the first call (resumeToken is nil), keep the original transaction selector
+			// from prepareExecuteSQL to avoid race conditions where the transaction state
+			// changes between prepareExecuteSQL and this callback execution.
+			if len(resumeToken) > 0 {
+				req.Transaction = t.getTransactionSelector()
+				seqnoDebugLog(logger, "query callback: resume operation, updated ts=%s", getTransactionSelectorDebugInfo(req.Transaction))
+			}
+
+			// Truncate SQL for logging
+			sqlPreview := req.Sql
+			if len(sqlPreview) > 80 {
+				sqlPreview = sqlPreview[:80] + "..."
+			}
+			seqnoDebugLog(logger, "query callback: txReadOnly=%p session=%s seqno=%d ts=%s lastSent=%d resumeToken=%d sql=%q",
+				t, req.Session, req.Seqno, getTransactionSelectorDebugInfo(req.Transaction),
+				atomic.LoadInt64(&t.lastSentSequenceNumber), len(resumeToken), sqlPreview)
+
+			// Check for out-of-order sequence numbers before sending.
+			// Only check on first call (resumeToken is nil), not on resume.
+			// Note: Use < instead of <= to allow retries of the same request (when seqno == lastSent).
+			// The streaming callback can be called multiple times for the same request due to
+			// internal retry logic in resumableStreamDecoder.
+			if req.Seqno > 0 && len(resumeToken) == 0 {
+				for {
+					lastSent := atomic.LoadInt64(&t.lastSentSequenceNumber)
+					if req.Seqno < lastSent {
+						seqnoDebugLog(logger, "query callback: OUT-OF-ORDER DETECTED! seqno=%d < lastSent=%d sql=%q", req.Seqno, lastSent, sqlPreview)
+						panic(fmt.Sprintf("spanner: out-of-order sequence number detected in query: attempting to send seqno %d, but last sent was %d (sql: %s). "+
+							"This indicates concurrent operations on the same transaction, which is not supported.", req.Seqno, lastSent, req.Sql))
+					}
+					if atomic.CompareAndSwapInt64(&t.lastSentSequenceNumber, lastSent, req.Seqno) {
+						seqnoDebugLog(logger, "query callback: CAS success, updated lastSent from %d to %d", lastSent, req.Seqno)
+						break
+					}
+					seqnoDebugLog(logger, "query callback: CAS failed, retrying (lastSent was %d, wanted to set %d)", lastSent, req.Seqno)
+				}
+			}
 			client, err := client.ExecuteStreamingSql(ctx, req, opts...)
 			if err != nil {
 				if _, ok := req.Transaction.GetSelector().(*sppb.TransactionSelector_Begin); ok {
@@ -735,8 +836,10 @@ func (t *txReadOnly) query(ctx context.Context, statement Statement, options Que
 func (t *txReadOnly) prepareExecuteSQL(ctx context.Context, stmt Statement, options QueryOptions) (*sppb.ExecuteSqlRequest, *sessionHandle, error) {
 	sh, ts, err := t.acquire(ctx)
 	if err != nil {
+		seqnoDebugLog(getLoggerFromSessionHandle(t.sh), "prepareExecuteSQL: acquire failed: %v", err)
 		return nil, nil, err
 	}
+	logger := getLoggerFromSessionHandle(sh)
 	// Cloud Spanner will return "Session not found" on bad sessions.
 	sid := sh.getID()
 	if sid == "" {
@@ -751,12 +854,13 @@ func (t *txReadOnly) prepareExecuteSQL(ctx context.Context, stmt Statement, opti
 	if options.Mode != nil {
 		mode = *options.Mode
 	}
+	newSeqno := atomic.AddInt64(&t.sequenceNumber, 1)
 	req := &sppb.ExecuteSqlRequest{
 		Session:             sid,
 		Transaction:         ts,
 		Sql:                 stmt.SQL,
 		QueryMode:           mode,
-		Seqno:               atomic.AddInt64(&t.sequenceNumber, 1),
+		Seqno:               newSeqno,
 		Params:              params,
 		ParamTypes:          paramTypes,
 		QueryOptions:        options.Options,
@@ -765,6 +869,15 @@ func (t *txReadOnly) prepareExecuteSQL(ctx context.Context, stmt Statement, opti
 		DirectedReadOptions: options.DirectedReadOptions,
 		LastStatement:       options.LastStatement,
 	}
+
+	// Truncate SQL for logging
+	sqlPreview := stmt.SQL
+	if len(sqlPreview) > 80 {
+		sqlPreview = sqlPreview[:80] + "..."
+	}
+	seqnoDebugLog(logger, "prepareExecuteSQL: txReadOnly=%p session=%s seqno=%d ts=%s lastSent=%d sql=%q",
+		t, sid, newSeqno, getTransactionSelectorDebugInfo(ts), atomic.LoadInt64(&t.lastSentSequenceNumber), sqlPreview)
+
 	return req, sh, nil
 }
 
@@ -1360,9 +1473,40 @@ func (t *ReadWriteTransaction) update(ctx context.Context, stmt Statement, opts 
 	if err != nil {
 		return 0, err
 	}
+	logger := getLoggerFromSessionHandle(sh)
 	hasInlineBeginTransaction := false
 	if _, ok := req.GetTransaction().GetSelector().(*sppb.TransactionSelector_Begin); ok {
 		hasInlineBeginTransaction = true
+	}
+
+	// Truncate SQL for logging
+	sqlPreview := stmt.SQL
+	if len(sqlPreview) > 80 {
+		sqlPreview = sqlPreview[:80] + "..."
+	}
+	seqnoDebugLog(logger, "update: txReadOnly=%p seqno=%d ts=%s hasInlineBegin=%v lastSent=%d sql=%q",
+		&t.txReadOnly, req.Seqno, getTransactionSelectorDebugInfo(req.Transaction),
+		hasInlineBeginTransaction, atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber), sqlPreview)
+
+	// Check for out-of-order sequence numbers before sending. This detects a race
+	// condition where concurrent DML operations could cause requests to be sent
+	// out of order. Spanner requires sequence numbers to be monotonically increasing.
+	// Note: Use < instead of <= to allow retries of the same request (when seqno == lastSent).
+	for {
+		lastSent := atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber)
+		if req.Seqno < lastSent {
+			seqnoDebugLog(logger, "update: OUT-OF-ORDER DETECTED! seqno=%d < lastSent=%d sql=%q", req.Seqno, lastSent, sqlPreview)
+			panic(fmt.Sprintf("spanner: out-of-order sequence number detected: attempting to send seqno %d, but last sent was %d. "+
+				"This indicates concurrent DML operations on the same transaction, which is not supported.", req.Seqno, lastSent))
+		}
+		// Only allow this request to proceed if no higher seqno has been sent yet.
+		// If a higher seqno was sent (concurrent DML), the CAS will fail and we'll
+		// detect the out-of-order condition on the next iteration.
+		if atomic.CompareAndSwapInt64(&t.txReadOnly.lastSentSequenceNumber, lastSent, req.Seqno) {
+			seqnoDebugLog(logger, "update: CAS success, updated lastSent from %d to %d", lastSent, req.Seqno)
+			break
+		}
+		seqnoDebugLog(logger, "update: CAS failed, retrying (lastSent was %d, wanted to set %d)", lastSent, req.Seqno)
 	}
 
 	var md metadata.MD
@@ -1467,12 +1611,31 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 		hasInlineBeginTransaction = true
 	}
 
+	seqno := atomic.AddInt64(&t.sequenceNumber, 1)
+
+	// Check for out-of-order sequence numbers before sending. This detects a race
+	// condition where concurrent DML operations could cause requests to be sent
+	// out of order. Spanner requires sequence numbers to be monotonically increasing.
+	for {
+		lastSent := atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber)
+		if seqno <= lastSent && lastSent > 0 {
+			panic(fmt.Sprintf("spanner: out-of-order sequence number detected: attempting to send seqno %d, but last sent was %d. "+
+				"This indicates concurrent DML operations on the same transaction, which is not supported.", seqno, lastSent))
+		}
+		// Only allow this request to proceed if no higher seqno has been sent yet.
+		// If a higher seqno was sent (concurrent DML), the CAS will fail and we'll
+		// detect the out-of-order condition on the next iteration.
+		if atomic.CompareAndSwapInt64(&t.txReadOnly.lastSentSequenceNumber, lastSent, seqno) {
+			break
+		}
+	}
+
 	var md metadata.MD
 	resp, err := sh.getClient().ExecuteBatchDml(contextWithOutgoingMetadata(ctx, sh.getMetadata(), t.disableRouteToLeader), &sppb.ExecuteBatchDmlRequest{
 		Session:        sh.getID(),
 		Transaction:    ts,
 		Statements:     sppbStmts,
-		Seqno:          atomic.AddInt64(&t.sequenceNumber, 1),
+		Seqno:          seqno,
 		RequestOptions: createRequestOptions(opts.Priority, opts.RequestTag, t.txOpts.TransactionTag),
 		LastStatements: opts.LastStatement,
 	}, gax.WithGRPCOptions(grpc.Header(&md)))
@@ -1524,15 +1687,18 @@ func (t *ReadWriteTransaction) batchUpdateWithOptions(ctx context.Context, stmts
 // in a ReadWriteTransaction by changing the state to init, all other operations will wait for state
 // to become active/closed. If state is active transactionID is already set, if closed returns error.
 func (t *ReadWriteTransaction) acquire(ctx context.Context) (*sessionHandle, *sppb.TransactionSelector, error) {
+	logger := getLoggerFromSessionHandle(t.sh)
 	for {
 		t.mu.Lock()
 		switch t.state {
 		case txClosed:
 			if t.tx == nil {
 				t.mu.Unlock()
+				seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txClosed, tx=nil, returning errInlineBeginTransactionFailed", &t.txReadOnly)
 				return nil, nil, t.updateTxState(errInlineBeginTransactionFailed(nil))
 			}
 			t.mu.Unlock()
+			seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txClosed, returning errTxClosed", &t.txReadOnly)
 			return nil, nil, errTxClosed()
 		case txNew:
 			// State transit to txInit so that only one TransactionSelector::begin
@@ -1556,25 +1722,31 @@ func (t *ReadWriteTransaction) acquire(ctx context.Context) (*sessionHandle, *sp
 				},
 			}
 			t.mu.Unlock()
+			seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txNew->txInit, returning Begin selector, seqno=%d lastSent=%d",
+				&t.txReadOnly, atomic.LoadInt64(&t.txReadOnly.sequenceNumber), atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber))
 			return sh, ts, nil
 		case txInit:
 			if t.tx == nil {
 				// Wait for a transaction ID to become ready.
 				txReadyOrClosed := t.txReadyOrClosed
 				t.mu.Unlock()
+				seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txInit, tx=nil, waiting for txReadyOrClosed", &t.txReadOnly)
 				select {
 				case <-txReadyOrClosed:
 					// Need to check transaction state again.
+					seqnoDebugLog(logger, "acquire: txReadOnly=%p txReadyOrClosed signaled, continuing loop", &t.txReadOnly)
 					continue
 				case <-ctx.Done():
 					// The waiting for initialization is timeout, return error
 					// directly.
+					seqnoDebugLog(logger, "acquire: txReadOnly=%p context done while waiting", &t.txReadOnly)
 					return nil, nil, errTxInitTimeout()
 				}
 			}
 			t.mu.Unlock()
 			// If first statement with TransactionSelector::begin succeeded, t.state should have been changed to
 			// txActive, so we can just continue here.
+			seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txInit but tx is set, continuing loop", &t.txReadOnly)
 			continue
 		case txActive:
 			sh := t.sh
@@ -1584,10 +1756,13 @@ func (t *ReadWriteTransaction) acquire(ctx context.Context) (*sessionHandle, *sp
 				},
 			}
 			t.mu.Unlock()
+			seqnoDebugLog(logger, "acquire: txReadOnly=%p state=txActive, returning Id selector (%x), seqno=%d lastSent=%d",
+				&t.txReadOnly, t.tx, atomic.LoadInt64(&t.txReadOnly.sequenceNumber), atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber))
 			return sh, ts, nil
 		default:
 			state := t.state
 			t.mu.Unlock()
+			seqnoDebugLog(logger, "acquire: txReadOnly=%p unexpected state=%v", &t.txReadOnly, state)
 			return nil, nil, errUnexpectedTxState(state)
 		}
 	}
@@ -1626,18 +1801,25 @@ func (t *ReadWriteTransaction) getTransactionSelector() *sppb.TransactionSelecto
 func (t *ReadWriteTransaction) setTransactionID(tx transactionID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	logger := getLoggerFromSessionHandle(t.sh)
 	// When inline begin transaction fails close the transaction to retry with explicit begin transaction
 	if tx == nil {
+		oldState := t.state
 		t.state = txClosed
 		// unblock other waiting operations to abort and retry with explicit begin transaction.
 		close(t.txReadyOrClosed)
 		t.txReadyOrClosed = make(chan struct{})
+		seqnoDebugLog(logger, "setTransactionID: txReadOnly=%p tx=nil, state %v->txClosed (inline begin failed), seqno=%d lastSent=%d",
+			&t.txReadOnly, oldState, atomic.LoadInt64(&t.txReadOnly.sequenceNumber), atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber))
 		return
 	}
+	oldState := t.state
 	t.tx = tx
 	t.state = txActive
 	close(t.txReadyOrClosed)
 	t.txReadyOrClosed = make(chan struct{})
+	seqnoDebugLog(logger, "setTransactionID: txReadOnly=%p tx=%x, state %v->txActive, seqno=%d lastSent=%d",
+		&t.txReadOnly, tx, oldState, atomic.LoadInt64(&t.txReadOnly.sequenceNumber), atomic.LoadInt64(&t.txReadOnly.lastSentSequenceNumber))
 }
 
 func (t *ReadWriteTransaction) updatePrecommitToken(token *sppb.MultiplexedSessionPrecommitToken) {
@@ -2065,6 +2247,9 @@ func newReadWriteStmtBasedTransactionWithSessionHandle(ctx context.Context, c *C
 	t.txOpts = c.txo.merge(options)
 	t.ct = c.ct
 	t.otConfig = c.otConfig
+
+	seqnoDebugLog(getLoggerFromSessionHandle(sh), "newReadWriteStmtBasedTransactionWithSessionHandle: txReadOnly=%p seqno=%d lastSent=%d previousTxID=%x",
+		&t.txReadOnly, t.txReadOnly.sequenceNumber, t.txReadOnly.lastSentSequenceNumber, previousTransactionID)
 
 	if t.shouldExplicitBegin(0, t.txOpts) {
 		// Explicitly begin the transactions

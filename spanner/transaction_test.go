@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2078,4 +2079,157 @@ func newAbortedErrorWithMinimalRetryDelay() error {
 	}
 	st, _ = st.WithDetails(retry)
 	return st.Err()
+}
+
+// TestReadWriteTransaction_SequenceNumberResetOnRetry verifies that the sequence
+// number is reset to 1 when a transaction is retried after a failed inline begin.
+// This is a regression test for a bug where the sequence number was not reset
+// when shouldExplicitBegin returned true for retry attempts, causing Spanner to
+// receive out-of-order sequence numbers.
+func TestReadWriteTransaction_SequenceNumberResetOnRetry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	// Configure the server to fail the first ExecuteSql with Aborted, which
+	// triggers an inline begin transaction failure and retry.
+	// On retry, shouldExplicitBegin returns true because:
+	// - attempt > 0
+	// - t.tx == nil (transaction ID was never set due to inline begin failure)
+	// - t.state != txNew (state was set to txInit during first attempt)
+	// This causes the transaction object to be reused, and the bug would cause
+	// the sequence number to NOT be reset.
+	server.TestSpanner.PutExecutionTime(MethodExecuteSql, SimulatedExecutionTime{
+		Errors: []error{status.Error(codes.Aborted, "Transaction aborted")},
+	})
+
+	attempts := 0
+	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) error {
+		attempts++
+		// Execute multiple DML statements to increment the sequence number.
+		if _, err := tx.Update(ctx, Statement{SQL: UpdateBarSetFoo}); err != nil {
+			return err
+		}
+		if _, err := tx.Update(ctx, Statement{SQL: UpdateBarSetFoo}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, w := attempts, 2; g != w {
+		t.Fatalf("attempt count mismatch:\nWant: %v\nGot: %v", w, g)
+	}
+
+	// Verify that the sequence numbers are correct.
+	gotReqs := drainRequestsFromServer(server.TestSpanner)
+
+	// Find all ExecuteSqlRequests and verify their sequence numbers.
+	var execReqs []*sppb.ExecuteSqlRequest
+	for _, req := range gotReqs {
+		if execReq, ok := req.(*sppb.ExecuteSqlRequest); ok {
+			execReqs = append(execReqs, execReq)
+		}
+	}
+
+	// We expect:
+	// - Attempt 1: ExecuteSql with inlined begin (seqno=1) -> Aborted
+	// - Attempt 2: BeginTransaction (explicit), ExecuteSql (seqno=1), ExecuteSql (seqno=2), Commit
+	// So we should have 3 ExecuteSqlRequests total:
+	// 1. First attempt, first statement (seqno=1) - fails
+	// 2. Second attempt, first statement (seqno=1) - should be 1, not 2!
+	// 3. Second attempt, second statement (seqno=2) - should be 2, not 3!
+	if len(execReqs) != 3 {
+		t.Fatalf("expected 3 ExecuteSqlRequests, got %d", len(execReqs))
+	}
+
+	t.Logf("Sequence numbers: %d, %d, %d", execReqs[0].Seqno, execReqs[1].Seqno, execReqs[2].Seqno)
+
+	// First attempt sequence number
+	if got, want := execReqs[0].Seqno, int64(1); got != want {
+		t.Errorf("sequence number for first attempt, first statement: got %d, want %d", got, want)
+	}
+
+	// The key assertion: the sequence number must be reset on retry.
+	// If the bug exists, these would be 2 and 3 instead of 1 and 2.
+	if got, want := execReqs[1].Seqno, int64(1); got != want {
+		t.Errorf("sequence number for second attempt, first statement: got %d, want %d (sequence number was not reset on retry)", got, want)
+	}
+	if got, want := execReqs[2].Seqno, int64(2); got != want {
+		t.Errorf("sequence number for second attempt, second statement: got %d, want %d (sequence number was not reset on retry)", got, want)
+	}
+}
+
+// TestReadWriteTransaction_ConcurrentDML_SequenceNumberOrdering verifies that
+// concurrent DML operations on the same transaction are detected and cause a panic.
+//
+// This test detects a race condition where two goroutines executing DML
+// concurrently could cause out-of-order sequence numbers:
+// 1. Goroutine A: prepareExecuteSQL -> gets seqno 1
+// 2. Goroutine B: prepareExecuteSQL -> gets seqno 2
+// 3. Goroutine B: sends request (seqno 2 arrives at Spanner first)
+// 4. Goroutine A: tries to send seqno 1 but detects out-of-order and panics
+// This would cause Spanner to abort the transaction with "out-of-order seqno" error.
+func TestReadWriteTransaction_ConcurrentDML_SequenceNumberOrdering(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	server, client, teardown := setupMockedTestServer(t)
+	defer teardown()
+
+	const numGoroutines = 10
+
+	var panicDetected int32
+	var wg sync.WaitGroup
+	_, _ = client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *ReadWriteTransaction) error {
+		// Run multiple concurrent DML operations
+		wg.Add(numGoroutines)
+		for i := 0; i < numGoroutines; i++ {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						if strings.Contains(fmt.Sprint(r), "out-of-order sequence number") {
+							atomic.AddInt32(&panicDetected, 1)
+						} else {
+							panic(r) // re-panic for unexpected panics
+						}
+					}
+					wg.Done()
+				}()
+				_, _ = tx.Update(ctx, Statement{SQL: UpdateBarSetFoo})
+			}()
+		}
+		wg.Wait()
+		return nil
+	})
+
+	// Check if the out-of-order detection triggered.
+	// Note: This may not always trigger depending on goroutine scheduling,
+	// but if it does trigger, it confirms the detection works.
+	if atomic.LoadInt32(&panicDetected) > 0 {
+		t.Logf("Out-of-order sequence number detection triggered %d times (expected behavior)", panicDetected)
+	}
+
+	// Also verify that sequence numbers arrived at the server in monotonically increasing order
+	// (for cases where detection didn't trigger due to favorable scheduling)
+	gotReqs := drainRequestsFromServer(server.TestSpanner)
+
+	var lastSeqno int64 = 0
+	var outOfOrderCount int
+	for _, req := range gotReqs {
+		if execReq, ok := req.(*sppb.ExecuteSqlRequest); ok {
+			if execReq.Seqno <= lastSeqno && lastSeqno > 0 {
+				outOfOrderCount++
+			}
+			lastSeqno = execReq.Seqno
+		}
+	}
+
+	// If we detected out-of-order at the server and no panic was triggered,
+	// that means the detection mechanism isn't working properly.
+	if outOfOrderCount > 0 && atomic.LoadInt32(&panicDetected) == 0 {
+		t.Errorf("out-of-order sequence numbers detected at server (%d occurrences) but panic detection did not trigger",
+			outOfOrderCount)
+	}
 }
